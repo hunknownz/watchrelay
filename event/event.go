@@ -34,6 +34,7 @@ func (e *LogEvent) TableName() string {
 
 type IEvent interface {
 	IsGap() bool
+	GetValue() any
 	GetResourceName() string
 	GetAction() EventAction
 	GetRevision() uint64
@@ -74,4 +75,8 @@ func (e *Event[T]) GetCreatedAt() time.Time {
 	return e.CreatedAt
 }
 
-type EventFunc func(rv, createRv uint64, action EventAction, createdAt time.Time, v []byte) IEvent
+func (e *Event[T]) GetValue() any {
+	return e.Value
+}
+
+type EventFunc func(rv, createRv uint64, action EventAction, createdAt time.Time, v []byte) (IEvent, error)

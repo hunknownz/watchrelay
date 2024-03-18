@@ -9,6 +9,7 @@ import (
 
 	"github.com/hunknownz/watchrelay/event"
 	"github.com/hunknownz/watchrelay/resource"
+	"github.com/hunknownz/watchrelay/sqllog"
 	"github.com/hunknownz/watchrelay/storage/mysql"
 	"github.com/sirupsen/logrus"
 
@@ -18,10 +19,40 @@ import (
 
 type WatchRelay struct {
 	seq    *Sequence
-	sqlLog *SQLLog
+	sqlLog *sqllog.SQLLog
 
 	db      *gorm.DB
-	dialect Dialect
+	dialect sqllog.Dialect
+}
+
+type WatchResult[T resource.IVersionedResource] struct {
+	Revision uint64
+	Events   []*event.Event[T]
+}
+
+type ConditionFunc[T resource.IVersionedResource] func(v T) bool
+
+func RegisterResource[T resource.IVersionedResource](w *WatchRelay) error {
+	var res T
+	resourceName := resource.GetResourceName(res)
+	fn := func(rv, createRv uint64, action event.EventAction, createdAt time.Time, v []byte) (event.IEvent, error) {
+		t := new(T)
+		err := json.Unmarshal(v, t)
+		if err != nil {
+			return nil, err
+		}
+		return &event.Event[T]{
+			Value:          *t,
+			CreateRevision: createRv,
+			Revision:       rv,
+			Action:         action,
+			ResourceName:   resourceName,
+			CreatedAt:      createdAt,
+		}, nil
+	}
+	w.sqlLog.Register(resourceName, fn)
+
+	return nil
 }
 
 func RegisterResource[T resource.IVersionedResource](w *WatchRelay) error {
@@ -58,7 +89,7 @@ func NewWatchRelay(db *gorm.DB) (w *WatchRelay, err error) {
 	}
 
 	var (
-		dialect  Dialect
+		dialect  sqllog.Dialect
 		startRev uint64
 	)
 	switch db.Dialector.Name() {
@@ -71,12 +102,9 @@ func NewWatchRelay(db *gorm.DB) (w *WatchRelay, err error) {
 		return nil, errors.New("watchrelay: unsupported database dialect")
 	}
 
-	sqlLog := &SQLLog{
-		d: dialect,
-	}
 	w = &WatchRelay{
 		seq:    NewSequence(startRev),
-		sqlLog: sqlLog,
+		sqlLog: sqllog.NewSQLLog(dialect),
 		db:     db,
 	}
 	return
@@ -99,7 +127,7 @@ func Create[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	}
 
 	resourceName := resource.GetResourceName(resources[0])
-	if w.sqlLog.IsRegisterd(resourceName) {
+	if !w.sqlLog.IsRegisterd(resourceName) {
 		return fmt.Errorf("watchrelay: resource %s not registered", resourceName)
 	}
 
@@ -165,7 +193,7 @@ func Update[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	}
 
 	resourceName := resource.GetResourceName(res)
-	if w.sqlLog.IsRegisterd(resourceName) {
+	if !w.sqlLog.IsRegisterd(resourceName) {
 		return fmt.Errorf("watchrelay: resource %s not registered", resourceName)
 	}
 
@@ -207,7 +235,7 @@ func Patch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, be
 	}
 
 	resourceName := resource.GetResourceName(res)
-	if w.sqlLog.IsRegisterd(resourceName) {
+	if !w.sqlLog.IsRegisterd(resourceName) {
 		return fmt.Errorf("watchrelay: resource %s not registered", resourceName)
 	}
 
@@ -254,7 +282,7 @@ func Delete[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	}
 
 	resourceName := resource.GetResourceName(resources[0])
-	if w.sqlLog.IsRegisterd(resourceName) {
+	if !w.sqlLog.IsRegisterd(resourceName) {
 		return fmt.Errorf("watchrelay: resource %s not registered", resourceName)
 	}
 
@@ -308,7 +336,7 @@ func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, re
 
 	var t T
 	resourceName := resource.GetResourceName(t)
-	if w.sqlLog.IsRegisterd(resourceName) {
+	if !w.sqlLog.IsRegisterd(resourceName) {
 		return 0, nil, fmt.Errorf("watchrelay: resource %s not registered", resourceName)
 	}
 	rev, iEvents, err := w.sqlLog.After(ctx, resourceName, rev, limit)
@@ -328,6 +356,51 @@ func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, re
 	return rev, events, nil
 }
 
-func Watch[T resource.IVersionedResource](ctx context.Context, resourceName string, rev uint64) (chan []*event.Event[T], error) {
-	return nil, nil
+func Watch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, resourceName string, rev uint64, cond ConditionFunc[T]) WatchResult[T] {
+	filter := func(events []event.IEvent) ([]event.IEvent, bool) {
+		if cond == nil {
+			return events, true
+		}
+
+		filtered := make([]*event.Event[T], 0, len(events))
+		for _, event := range events {
+			v := event.GetValue().(T)
+			if cond(v) {
+				filtered = append(filtered, event.(*event.Event[T]))
+			}
+		}
+		return filtered, len(filtered) > 0
+	}
+
+	// start watch
+	ctx, cancel := context.WithCancel(ctx)
+	readCh := w.sqlLog.Watch(ctx, resourceName)
+
+	// should contain current resource version
+	if rev > 0 {
+		rev--
+	}
+
+	resultCh := make(chan []*event.Event[T], 128)
+	watchResult := WatchResult[T]{
+		Revision: rev,
+		Events:   <-resultCh,
+	}
+
+	rev, events, err := After[T](w, ctx, rev, 0)
+	if err != nil {
+		logrus.Errorf("watchrelay: failed to list events after revision %d: %v", rev, err)
+	}
+
+	go func() {
+		defer cancel()
+		for value := range readCh {
+			events, ok := filter(value)
+			if ok {
+				resultCh <- events
+			}
+		}
+	}()
+
+	return watchResult
 }

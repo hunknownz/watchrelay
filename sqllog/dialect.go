@@ -1,4 +1,4 @@
-package watchrelay
+package sqllog
 
 import (
 	"context"
