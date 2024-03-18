@@ -1,4 +1,4 @@
-package tidb
+package sqlite
 
 import "database/sql"
 
