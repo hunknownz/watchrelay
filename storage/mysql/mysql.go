@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -72,6 +73,19 @@ func (d *MysqlDialect) CurrentRevision(ctx context.Context) (uint64, error) {
 
 func (d *MysqlDialect) ClearExpiredEvents(ctx context.Context, dur time.Duration) (int, error) {
 	return 0, nil
+}
+
+func (d *MysqlDialect) FillGap(ctx context.Context, revision uint64, resourceName string) error {
+	_, err := d.db.ExecContext(ctx, generic.FillGapSQL, revision, resourceName, revision, time.Now())
+	var errSql *mysql.MySQLError
+	if errors.As(err, &errSql) {
+		if errSql.Number == 1062 {
+			// Duplicate key error
+			logrus.Debugf("watchrelay: gap %d already filled", revision)
+			return nil
+		}
+	}
+	return err
 }
 
 func New(db *sql.DB) (*MysqlDialect, uint64, error) {

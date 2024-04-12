@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	wr "github.com/hunknownz/watchrelay"
@@ -17,14 +18,14 @@ import (
 
 type Task struct {
 	resource.Meta
-	uuid string
+	Uuid string
 }
 
 func produceTask(w *wr.WatchRelay, nTasks int) {
 	// create task
 	for i := 0; i < nTasks; i++ {
 		task := &Task{
-			uuid: fmt.Sprintf("task-%d", i),
+			Uuid: fmt.Sprintf("task-%d", i),
 		}
 		ctx := context.Background()
 		err := wr.Create[*Task](w, ctx, nil, nil, task)
@@ -36,9 +37,16 @@ func produceTask(w *wr.WatchRelay, nTasks int) {
 	}
 }
 
-func consumeTask() {
+func consumeTask(w *wr.WatchRelay) {
 	// consume task
 
+	r := wr.Watch[*Task](w, context.Background(), nil, 0)
+
+	for events := range r.Events {
+		for _, event := range events {
+			fmt.Printf("task: %+v\n", event.Value)
+		}
+	}
 }
 
 func initDatabase() (*gorm.DB, error) {
@@ -76,8 +84,23 @@ func main() {
 		logrus.Errorf("wr.RegisterResource %s", err)
 		panic(err)
 	}
+	w.Start(context.Background())
 
-	// var wg sync.WaitGroup
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		produceTask(w, 10)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		consumeTask(w)
+	}()
+
+	wg.Wait()
 
 	// rev, events, err := wr.After[*Task](w, ctx, 0, 0)
 	// if err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hunknownz/watchrelay/event"
+	"github.com/hunknownz/watchrelay/sqllog"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,7 +17,7 @@ const (
 )
 
 type SQLLog struct {
-	d          Dialect
+	d          sqllog.Dialect
 	ctx        context.Context
 	currentRev uint64
 	notify     chan uint64
@@ -25,7 +26,7 @@ type SQLLog struct {
 	eventFuncMap map[string]event.EventFunc
 }
 
-func New(d Dialect) *SQLLog {
+func New(d sqllog.Dialect) *SQLLog {
 	l := &SQLLog{
 		d:      d,
 		notify: make(chan uint64, 1024),
@@ -67,7 +68,7 @@ func (s *SQLLog) RowsToEvents(rows *sql.Rows) (rev uint64, events []event.IEvent
 			continue
 		}
 
-		event := generateFunc(revision, createRevision, action, createdAt, value)
+		event, err := generateFunc(revision, createRevision, action, createdAt, value)
 		if err != nil {
 			return 0, nil, err
 		}

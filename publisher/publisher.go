@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/hunknownz/watchrelay/event"
@@ -14,21 +15,53 @@ type Publisher struct {
 	running bool
 }
 
+type ISubscriber interface {
+	Close()
+	Send(pub *Publisher, events []event.IEvent, resourceName string) bool
+}
+
+type Subscriber[T resource.IVersionedResource] chan []*event.Event[T]
+
+func (s Subscriber[T]) Close() {
+	close(s)
+}
+
+func (s Subscriber[T]) Send(pub *Publisher, iEvents []event.IEvent, resourceName string) bool {
+	events, ok := filter[T](iEvents, resourceName)
+	if !ok {
+		return true
+	}
+
+	select {
+	case s <- events:
+	default:
+		// drop slow subscriber
+		pub.unsubscribe(s)
+	}
+	return true
+}
+
 func Subscribe[T resource.IVersionedResource](pub *Publisher, ctx context.Context, establish func() (chan []event.IEvent, error)) (sub <-chan []*event.Event[T], err error) {
-	if !p.running {
-		err = p.start(establish)
+	if pub == nil {
+		return nil, errors.New("watchrelay: Publisher is nil")
+
+	}
+
+	if !pub.running {
+		err = pub.start(establish)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	var v T
-	sub = make(chan []*event.Event[T], 128)
+	subscriber := make(Subscriber[T], 128)
+	sub = subscriber
 	resourceName := resource.GetResourceName(v)
-	pub.Store(sub, resourceName)
+	pub.Store(ISubscriber(subscriber), resourceName)
 	go func() {
 		<-ctx.Done()
-		pub.unsubscribe(sub)
+		pub.unsubscribe(subscriber)
 	}()
 
 	return sub, nil
@@ -46,31 +79,31 @@ func (p *Publisher) start(establish func() (chan []event.IEvent, error)) error {
 	return nil
 }
 
-func filter(events []event.IEvent, resourceName string) ([]event.IEvent, bool) {
-	return events, true
+func filter[T resource.IVersionedResource](events []event.IEvent, resourceName string) ([]*event.Event[T], bool) {
+	var filtered []*event.Event[T]
+	for _, e := range events {
+		if e.GetResourceName() == resourceName {
+			filtered = append(filtered, e.(*event.Event[T]))
+		}
+	}
+	return filtered, len(filtered) > 0
 }
 
 func (p *Publisher) broadcast(ch chan []event.IEvent) {
 	for events := range ch {
 		p.Range(func(key, value interface{}) bool {
-			sub := value.(chan []event.IEvent)
-			select {
-			case sub <- events:
-			default:
-				// drop slow subscriber
-				go unsubscribe(p, sub)
-			}
-			return true
+			sub := key.(ISubscriber)
+			return sub.Send(p, events, value.(string))
 		})
 	}
 }
 
-func unsubscribe[T resource.IVersionedResource](pub *Publisher, key chan []*event.Event[T]) {
-	sub, ok := pub.Load(key)
+func (p *Publisher) unsubscribe(key ISubscriber) {
+	_, ok := p.Load(key)
 	if !ok {
 		return
 	}
 
-	close(sub.(chan []*event.Event[T]))
-	pub.Delete(key)
+	key.Close()
+	p.Delete(key)
 }

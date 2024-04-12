@@ -27,7 +27,7 @@ type WatchRelay struct {
 
 type WatchResult[T resource.IVersionedResource] struct {
 	Revision uint64
-	Events   []*event.Event[T]
+	Events   chan []*event.Event[T]
 }
 
 type ConditionFunc[T resource.IVersionedResource] func(v T) bool
@@ -51,31 +51,6 @@ func RegisterResource[T resource.IVersionedResource](w *WatchRelay) error {
 		}, nil
 	}
 	w.sqlLog.Register(resourceName, fn)
-
-	return nil
-}
-
-func RegisterResource[T resource.IVersionedResource](w *WatchRelay) error {
-	var t T
-	err := json.Unmarshal([]byte{}, &t)
-	if err != nil {
-		return err
-	}
-	resourceName := resource.GetResourceName(t)
-	fn := func(rv, createRv uint64, action event.EventAction, createdAt time.Time, v []byte) event.IEvent {
-		return &event.Event[T]{
-			Value:          t,
-			CreateRevision: createRv,
-			Revision:       rv,
-			Action:         action,
-			ResourceName:   resourceName,
-			CreatedAt:      createdAt,
-		}
-	}
-
-	w.sqlLog.fMutex.Lock()
-	defer w.sqlLog.fMutex.Unlock()
-	w.sqlLog.eventFuncMap[resourceName] = fn
 
 	return nil
 }
@@ -108,6 +83,10 @@ func NewWatchRelay(db *gorm.DB) (w *WatchRelay, err error) {
 		db:     db,
 	}
 	return
+}
+
+func (w *WatchRelay) Start(ctx context.Context) {
+	w.sqlLog.Start(ctx)
 }
 
 // BatchHook is executed before or after creating, updating, or deleting resources in the database.
@@ -329,7 +308,7 @@ func Delete[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	return tx.Commit().Error
 }
 
-func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, rev uint64, limit int64) (uint64, []*event.Event[T], error) {
+func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, cond ConditionFunc[T], rev uint64, limit int64) (uint64, []*event.Event[T], error) {
 	if w == nil {
 		return 0, nil, errors.New("watchrelay: WatchRelay is nil")
 	}
@@ -350,14 +329,17 @@ func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, re
 			logrus.Errorf("watchrelay: invalid event type %T", iEvents[i])
 			continue
 		}
+		if cond != nil && !cond(event.Value) {
+			continue
+		}
 		events = append(events, event)
 	}
 
 	return rev, events, nil
 }
 
-func Watch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, resourceName string, rev uint64, cond ConditionFunc[T]) WatchResult[T] {
-	filter := func(events []event.IEvent) ([]event.IEvent, bool) {
+func Watch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, cond ConditionFunc[T], rev uint64) WatchResult[T] {
+	eventFilter := func(events []*event.Event[T]) ([]*event.Event[T], bool) {
 		if cond == nil {
 			return events, true
 		}
@@ -366,7 +348,7 @@ func Watch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, re
 		for _, event := range events {
 			v := event.GetValue().(T)
 			if cond(v) {
-				filtered = append(filtered, event.(*event.Event[T]))
+				filtered = append(filtered, event)
 			}
 		}
 		return filtered, len(filtered) > 0
@@ -374,33 +356,54 @@ func Watch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, re
 
 	// start watch
 	ctx, cancel := context.WithCancel(ctx)
-	readCh := w.sqlLog.Watch(ctx, resourceName)
+	readCh := sqllog.Watch[T](w.sqlLog, ctx, eventFilter)
 
 	// should contain current resource version
 	if rev > 0 {
 		rev--
 	}
 
-	resultCh := make(chan []*event.Event[T], 128)
+	results := make(chan []*event.Event[T], 128)
 	watchResult := WatchResult[T]{
 		Revision: rev,
-		Events:   <-resultCh,
+		Events:   results,
 	}
 
-	rev, events, err := After[T](w, ctx, rev, 0)
+	curRev, events, err := After[T](w, ctx, cond, rev, 0)
 	if err != nil {
 		logrus.Errorf("watchrelay: failed to list events after revision %d: %v", rev, err)
+		cancel()
 	}
 
 	go func() {
-		defer cancel()
+		defer func() {
+			close(results)
+			cancel()
+		}()
+
+		lastRev := rev
+		if len(events) > 0 {
+			lastRev = curRev
+		}
+
+		if len(events) > 0 {
+			results <- events
+		}
+
 		for value := range readCh {
-			events, ok := filter(value)
-			if ok {
-				resultCh <- events
+			events, ok := filter[T](value, lastRev)
+			if !ok {
+				results <- events
 			}
 		}
 	}()
 
 	return watchResult
+}
+
+func filter[T resource.IVersionedResource](events []*event.Event[T], rev uint64) ([]*event.Event[T], bool) {
+	for len(events) > 0 && events[0].Revision <= rev {
+		events = events[1:]
+	}
+	return events, len(events) > 0
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/hunknownz/watchrelay/event"
 	"github.com/hunknownz/watchrelay/publisher"
+	"github.com/hunknownz/watchrelay/resource"
 	"github.com/sirupsen/logrus"
 )
 
@@ -20,7 +21,7 @@ type SQLLog struct {
 	d          Dialect
 	ctx        context.Context
 	currentRev uint64
-	publisher  publisher.Publisher
+	pub        *publisher.Publisher
 	notify     chan uint64
 
 	fMutex       sync.Mutex
@@ -32,8 +33,32 @@ func NewSQLLog(d Dialect) *SQLLog {
 		d:            d,
 		notify:       make(chan uint64, 1024),
 		eventFuncMap: make(map[string]event.EventFunc),
+		pub:          &publisher.Publisher{},
 	}
 	return l
+}
+
+func (s *SQLLog) FillGap(resourceName string, revision uint64) {
+	ctx, cancel := context.WithCancel(s.ctx)
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				cancel()
+				return
+			default:
+				err := s.d.FillGap(ctx, revision, resourceName)
+				if err == nil {
+					return
+				}
+				logrus.Errorf("watchrelay: failed to fill gap %d: %v", revision, err)
+			}
+		}
+	}()
+}
+
+func (s *SQLLog) Start(ctx context.Context) {
+	s.ctx = ctx
 }
 
 func (s *SQLLog) IsRegisterd(resourceName string) bool {
@@ -99,11 +124,11 @@ func (s *SQLLog) After(ctx context.Context, resourceName string, revision uint64
 	return s.RowsToEvents(rows)
 }
 
-type filterFunc func(events []event.IEvent) ([]event.IEvent, bool)
+type EventFilter[T resource.IVersionedResource] func([]*event.Event[T]) ([]*event.Event[T], bool)
 
-func (s *SQLLog) Watch(ctx context.Context, resourceName string, filter filterFunc) <-chan []event.IEvent {
-	results := make(chan []event.IEvent, 128)
-	watchCh, err := s.publisher.Subscribe(ctx, resourceName string, s.startWatch)
+func Watch[T resource.IVersionedResource](sl *SQLLog, ctx context.Context, filter EventFilter[T]) <-chan []*event.Event[T] {
+	results := make(chan []*event.Event[T], 128)
+	watchCh, err := publisher.Subscribe[T](sl.pub, ctx, sl.startWatch)
 	if err != nil {
 		return nil
 	}
@@ -111,9 +136,9 @@ func (s *SQLLog) Watch(ctx context.Context, resourceName string, filter filterFu
 	go func() {
 		defer close(results)
 		for value := range watchCh {
-			events, ok := filter(value)
+			filtered, ok := filter(value)
 			if ok {
-				results <- events
+				results <- filtered
 			}
 		}
 	}()
