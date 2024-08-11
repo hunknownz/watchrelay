@@ -162,7 +162,18 @@ func Create[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 		return nil
 	}
 
-	return db.WithContext(ctx).Transaction(fn)
+	err := db.WithContext(ctx).Transaction(fn)
+	if err != nil {
+		for _, res := range resources {
+			if res.GetResourceVersion() <= 0 {
+				continue
+			}
+			w.sqlLog.FillGap(resourceName, res.GetResourceVersion())
+		}
+		return err
+	}
+
+	return nil
 }
 
 // Update updates resources and event logs in the database.
@@ -177,35 +188,51 @@ func Update[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	}
 
 	db := w.db
-	tx := db.Begin()
 
-	if beforeUpdate != nil {
-		err := beforeUpdate(tx, res)
-		if err != nil {
+	fn := func(tx *gorm.DB) error {
+		if beforeUpdate != nil {
+			err := beforeUpdate(tx, res)
+			if err != nil {
+				return err
+			}
+		}
+
+		res.SetResourceVersion(w.seq.Next())
+
+		event := &event.Event[T]{
+			Revision:     res.GetResourceVersion(),
+			ResourceName: resourceName,
+			Action:       event.EventActionUpdate,
+			Value:        res,
+		}
+
+		if err := tx.Save(res).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
+		if err := tx.Create(event).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		if afterUpdate != nil {
+			err := afterUpdate(tx, res)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		return nil
 	}
 
-	res.SetResourceVersion(w.seq.Next())
-
-	event := &event.Event[T]{
-		Revision:     res.GetResourceVersion(),
-		ResourceName: resourceName,
-		Action:       event.EventActionUpdate,
-		Value:        res,
-	}
-
-	if err := tx.Save(res).Error; err != nil {
-		tx.Rollback()
+	err := db.WithContext(ctx).Transaction(fn)
+	if err != nil {
+		w.sqlLog.FillGap(resourceName, res.GetResourceVersion())
 		return err
 	}
-	if err := tx.Create(event).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
 
-	return tx.Commit().Error
+	return nil
 }
 
 func Patch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, beforePatch, afterPatch Hook[T], res T) error {
@@ -219,38 +246,54 @@ func Patch[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, be
 	}
 
 	db := w.db
-	tx := db.Begin()
 
-	if beforePatch != nil {
-		err := beforePatch(tx, res)
-		if err != nil {
+	fn := func(tx *gorm.DB) error {
+		if beforePatch != nil {
+			err := beforePatch(tx, res)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		res.SetResourceVersion(w.seq.Next())
+
+		event := &event.Event[T]{
+			Revision:     res.GetResourceVersion(),
+			ResourceName: resource.GetResourceName(res),
+			Action:       event.EventActionUpdate,
+			Value:        res,
+		}
+
+		if err := tx.Save(res).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
+		if err := tx.Create(event).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		if afterPatch != nil {
+			err := afterPatch(tx, res)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		return nil
 	}
 
-	res.SetResourceVersion(w.seq.Next())
-
-	event := &event.Event[T]{
-		Revision:     res.GetResourceVersion(),
-		ResourceName: resource.GetResourceName(res),
-		Action:       event.EventActionUpdate,
-		Value:        res,
-	}
-
-	if err := tx.Save(res).Error; err != nil {
-		tx.Rollback()
+	err := db.WithContext(ctx).Transaction(fn)
+	if err != nil {
+		w.sqlLog.FillGap(resourceName, res.GetResourceVersion())
 		return err
 	}
-	if err := tx.Create(event).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
 
-	return tx.Commit().Error
+	return nil
 }
 
-// Delete deletes resources and event logs in the database.
 func Delete[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, beforeDelete, afterDelete BatchHook[T], resources ...T) error {
 	if w == nil {
 		return errors.New("watchrelay: WatchRelay is nil")
@@ -266,46 +309,60 @@ func Delete[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, b
 	}
 
 	db := w.db
-	tx := db.Begin()
 
-	if beforeDelete != nil {
-		err := beforeDelete(tx, resources...)
-		if err != nil {
+	fn := func(tx *gorm.DB) error {
+		if beforeDelete != nil {
+			err := beforeDelete(tx, resources...)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		events := make([]*event.Event[T], len(resources))
+		for i, res := range resources {
+			res.SetResourceVersion(w.seq.Next())
+
+			events[i] = &event.Event[T]{
+				Revision:     res.GetResourceVersion(),
+				ResourceName: resourceName,
+				Action:       event.EventActionDelete,
+				Value:        res,
+			}
+		}
+
+		if err := tx.Delete(resources).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
-	}
-
-	events := make([]*event.Event[T], len(resources))
-	for i, res := range resources {
-		res.SetResourceVersion(w.seq.Next())
-
-		events[i] = &event.Event[T]{
-			Revision:     res.GetResourceVersion(),
-			ResourceName: resourceName,
-			Action:       event.EventActionDelete,
-			Value:        res,
-		}
-	}
-
-	if err := tx.Delete(resources).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-	if err := tx.Create(events).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	if afterDelete != nil {
-		err := afterDelete(tx, resources...)
-		if err != nil {
+		if err := tx.Create(events).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
+
+		if afterDelete != nil {
+			err := afterDelete(tx, resources...)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		return nil
 	}
 
-	return tx.Commit().Error
+	err := db.WithContext(ctx).Transaction(fn)
+	if err != nil {
+		for _, res := range resources {
+			if res.GetResourceVersion() <= 0 {
+				continue
+			}
+			w.sqlLog.FillGap(resourceName, res.GetResourceVersion())
+		}
+		return err
+	}
+
+	return nil
 }
 
 func After[T resource.IVersionedResource](w *WatchRelay, ctx context.Context, cond ConditionFunc[T], rev uint64, limit int64) (uint64, []*event.Event[T], error) {
